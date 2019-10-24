@@ -1,0 +1,116 @@
+#!/usr/bin/env python
+
+# Columbia Engineering
+# MECS 4602 - Fall 2018
+
+import math
+import numpy
+import time
+
+import rospy
+
+from state_estimator.msg import RobotPose
+from state_estimator.msg import SensorData
+
+class Estimator(object):
+    def __init__(self):
+
+        # Publisher to publish state estimate
+        self.pub_est = rospy.Publisher("/robot_pose_estimate", RobotPose, queue_size=1)
+
+        # Initial estimates for the state and the covariance matrix
+        self.x = numpy.zeros((3,1))
+        self.P = numpy.zeros((3,3))
+
+        # Covariance matrix for process (model) noise
+        self.V = numpy.zeros((3,3))
+        self.V[0,0] = 0.0025
+        self.V[1,1] = 0.0025
+        self.V[2,2] = 0.005
+
+        self.step_size = 0.01
+
+        # Subscribe to command input and sensory output of robot
+        rospy.Subscriber("/sensor_data", SensorData, self.sensor_callback)
+        
+    # This function gets called every time the robot publishes its control 
+    # input and sensory output. You must make use of what you know about 
+    # extended Kalman filters to come up with an estimate of the current
+    # state of the robot and covariance matrix.
+    # The SensorData message contains fields 'vel_trans' and 'vel_ang' for
+    # the commanded translational and rotational velocity respectively. 
+    # Furthermore, it contains a list 'readings' of the landmarks the
+    # robot can currently observe
+    def estimate(self, sens):
+
+        #### ----- YOUR CODE GOES HERE ----- ####
+        xnext = numpy.zeros((3, 1))
+        xnext[0] = self.x[0] + self.step_size * sens.vel_trans * numpy.cos(self.x[2])
+        xnext[1] = self.x[1] + self.step_size * sens.vel_trans * numpy.sin(self.x[2])
+        xnext[2] = self.x[2] + self.step_size * sens.vel_ang
+        Fcap = numpy.zeros((3, 3))
+        Fcap[0][0] = 1
+        Fcap[0][1] = 0
+        Fcap[0][2] = - self.step_size * sens.vel_trans *numpy.sin(self.x[2])
+        Fcap[1][0] = 0
+        Fcap[1][1] = 1
+        Fcap[1][2] = self.step_size * sens.vel_trans *numpy.cos(self.x[2])
+        Fcap[2][0] = 0
+        Fcap[2][1] = 0
+        Fcap[2][2] = 1
+        Pcap = numpy.dot(Fcap, (numpy.dot(self.P, numpy.transpose(Fcap)))) + self.V
+        if len(sens.readings) == 0:
+            self.x = xnext
+            self.P = Pcap
+        else:
+            Hbig = numpy.zeros((len(sens.readings)*2, 3))
+            vnew = numpy.zeros((len(sens.readings)*2, 1))
+            hsmall = numpy.zeros((len(sens.readings)*2, 1))
+            w = numpy.identity(len(sens.readings)*2)
+            for i in range (len(sens.readings)):
+                x = xnext[0]-sens.readings[i].landmark.x
+                y = xnext[1]-sens.readings[i].landmark.y
+                hsmall[2*i] = math.sqrt(numpy.square(x) + numpy.square(y))
+                hsmall[2*i+1] = math.atan2(-y,-x) - xnext[2]
+                if hsmall[2*i] > 0.1:
+                    x1 = x/math.sqrt(x*x + y*y)
+                    y1 = y/math.sqrt(x*x + y*y)
+                    Hbig[2*i,0] = x1
+                    Hbig[2*i,1] = y1
+                    Hbig[2*i,2] = 0
+                    x1 = -y/(x*x + y*y)
+                    y1 = x/(x*x + y*y)
+                    Hbig[(2*i+1),0] = x1
+                    Hbig[(2*i+1),1] = y1
+                    Hbig[(2*i+1),2] = -1
+                    ranger = sens.readings[i].range - hsmall[2*i]
+                    bearing = sens.readings[i].bearing - hsmall[(2*i+1)]
+                    while bearing < -1*numpy.pi or bearing > numpy.pi:
+                        if bearing < -numpy.pi:
+                            bearing += 2*numpy.pi
+                        elif bearing > numpy.pi:
+                            bearing -= 2*numpy.pi
+                    vnew[(2 * i + 1), 0] = bearing
+                    vnew[2*i,0] = ranger
+                    w[(2 * i),(2 * i)] = 0.1
+                    w[(2*i + 1),(2*i + 1)] = 0.05
+            S = numpy.dot(numpy.dot(Hbig,Pcap),numpy.transpose(Hbig)) + w
+            R = numpy.dot(numpy.dot(Pcap,numpy.transpose(Hbig)),numpy.linalg.inv(S))
+            self.x = xnext + numpy.dot(R,vnew)
+            self.P = Pcap - numpy.dot(R,numpy.dot(Hbig,Pcap))
+
+    def sensor_callback(self,sens):
+
+        # Publish state estimate 
+        self.estimate(sens)
+        est_msg = RobotPose()
+        est_msg.header.stamp = sens.header.stamp
+        est_msg.pose.x = self.x[0]
+        est_msg.pose.y = self.x[1]
+        est_msg.pose.theta = self.x[2]
+        self.pub_est.publish(est_msg)
+
+if __name__ == '__main__':
+    rospy.init_node('state_estimator', anonymous=True)
+    est = Estimator()
+    rospy.spin()
